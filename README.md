@@ -1,4 +1,4 @@
-![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-grill-banner.png)
+![Urban Tandoor & Grill AI Restaurant Assistant](assets/Urban Tandoor AI Dining Experience.png)
 
 # Urban Tandoor – Data Engineering Pipeline
 
