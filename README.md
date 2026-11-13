@@ -1,3 +1,5 @@
+![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-grill-banner.png)
+
 # Urban Tandoor – Data Engineering Pipeline
 
 Loads the **Menu Catalog** and **Two-Branch Inventory** workbooks (Excel **or JSON**) into **PostgreSQL**, and stores
