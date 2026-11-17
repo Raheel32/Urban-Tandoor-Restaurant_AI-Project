@@ -1,5 +1,4 @@
 .env
-__pycache__/
 .venv/
-data/archive/*
-!data/archive/.gitkeep
+__pycache__/
+.pytest_cache/

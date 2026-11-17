@@ -1,206 +1,224 @@
 ![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-ai-dining-experience.png)
 
-# Urban Tandoor – Data Engineering Pipeline
+![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-ai-dining-experience.png)
+# Urban Tandoor â€“ MongoDB + Embeddings + FastAPI
 
-Loads the **Menu Catalog** and **Two-Branch Inventory** workbooks (Excel **or JSON**) into **PostgreSQL**, and stores
-**document embeddings** (Gemini) in the same database using **pgvector**.
-Built so that next week's updated Excel file is a one-command refresh.
+Loads the two JSON files (menu catalog + two-branch inventory) into **MongoDB Atlas** as embedded
+documents, creates **Gemini embeddings** for semantic search, and exposes **CRUD for every collection**
+through **FastAPI**.
 
 ```
- .xlsx / .json ─► EXTRACT ──► VALIDATE ──► LOAD (upsert) ──► BUILD DOCUMENTS ──► EMBED ──► pgvector
- (data/incoming)  read+clean  fail fast    1 transaction     from the DB          only changed docs
-                                                │
-                                                └──► archive copy + etl_runs log
+ data/json/*.json â”€â–º TRANSFORM â”€â–º VALIDATE â”€â–º UPSERT â”€â–º INDEXES â”€â–º EMBED â”€â–º MongoDB Atlas
+                     embed lists   Pydantic +  only changed   (also vector   only changed       â”‚
+                     into documents references  documents     search index)  documents          â–¼
+                                                                                         FastAPI  (/docs)
+                                                                      CRUD â—„â”€â”€ GET/POST/PUT/PATCH/DELETE
+                                                                      GET /search Â· GET /availability/{branch}
 ```
 
 ---------------------------------------------------------------------------------------------------
 
-## 1. Quick start (10 minutes)
+## 1. Setup (about 15 minutes, no Docker needed)
 
-```bash
-# 0. Python 3.10+ and Docker Desktop installed
-python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Scripts\activate
+### 1.1 Create the free Atlas database
+1. Sign up at **mongodb.com/cloud/atlas** â†’ **Create** a free **M0** cluster (any region near you).
+2. **Database Access** â†’ *Add New Database User* â†’ username + password (write the password down).
+3. **Network Access** â†’ *Add IP Address* â†’ **Add Current IP Address** (or `0.0.0.0/0` for a demo; not for real data).
+4. **Clusters â†’ Connect â†’ Drivers** â†’ copy the connection string:
+   `mongodb+srv://USER:<password>@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority`
+
+### 1.2 Install and configure
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-# 1. Database (Postgres 16 + pgvector)
-docker compose up -d
-
-# 2. Settings
-cp .env.example .env            # Windows: copy .env.example .env
-#    -> paste your free key from https://aistudio.google.com/apikey into GEMINI_API_KEY
-
-# 3. Create tables (idempotent - also happens automatically on every run)
-python -m pipeline init-db
-
-# 4. Check the Excel files WITHOUT writing anything
-python -m pipeline run --dry-run
-
-# 5. Real run
-python -m pipeline run
-
-# 6. Look around
-python -m pipeline status
-python -m pipeline search "biryani for dinner" -k 3
+copy .env.example .env
 ```
+Edit `.env`:
+* `MONGODB_URI` â†’ your string with the real password. Special characters must be URL-encoded (`@` â†’ `%40`, `#` â†’ `%23`).
+* `GEMINI_API_KEY` â†’ free key from aistudio.google.com/apikey (or set `EMBEDDING_PROVIDER=fake` to test without it).
 
-No Gemini key yet? Set `EMBEDDING_PROVIDER=fake` in `.env`. It uses an offline hashing embedder so you can
-test everything else. Switch back to `gemini` later and run `python -m pipeline embed --force`.
+### 1.3 Load the data, then start the API
+```powershell
+python -m app.ingest --dry-run        # validate the JSON only, write nothing
+python -m app.ingest                  # load everything + embeddings + Atlas vector index
+uvicorn app.main:app --reload         # API on http://127.0.0.1:8000
+```
+Open **http://127.0.0.1:8000/docs**. Every endpoint can be tried from the browser (button *Try it out*).
 
 ---------------------------------------------------------------------------------------------------
 
-## 2. Everyday operations (the "future updates" part)
+## 2. What is stored (10 collections + 2 system collections)
 
-| Situation | What you do |
+| Collection | Documents | Notes |
+|---|---:|---|
+| `menu_items` | 118 | **Embedded:** `variants[]`, `addons[]`, `aliases[]`, `branches[]` (price/availability per branch), `recipe[]` |
+| `categories` | 8 | |
+| `deals` | 6 | **Embedded:** `items[]` |
+| `ingredients` | 60 | references `supplier_id` |
+| `suppliers` | 7 | |
+| `branches` | 2 | |
+| `branch_stock` | 120 | `_id` = `BRANCH_ID:INGREDIENT_ID` |
+| `stock_movements` | 8 | |
+| `allergen_guide`, `service_rules` | 8, 7 | |
+| `documents` | 199 | text + 768-number embedding for semantic search |
+| `ingest_runs` | â€“ | one row per ingest: when, result, stats |
+
+Not loaded: `START_HERE`, `Dashboard`, `Menu_Availability` (documentation / derived values). Live availability is computed from stock instead.
+
+One menu document (shortened, values illustrative):
+```json
+{ "_id": "MENU001", "menu_id": "MENU001", "item_name": "Chicken Biryani", "base_price_pkr": 420.0,
+  "variants": [ {"variant_id": "...", "variant_name": "...", "price_pkr": 420.0} ],
+  "addons":   [ {"addon_id": "...", "addon_name": "...", "price_pkr": 100.0, "selectable": "Yes"} ],
+  "aliases":  [ {"alias_id": "...", "customer_phrase": "chicken biryani", "language": "English"} ],
+  "branches": [ {"branch_id": "UTG-KHI-001", "enabled_for_order": "Yes", "price_pkr": 420.0} ],
+  "recipe":   [ {"ingredient_id": "ING001", "ingredient_name": "...", "qty_per_portion": 0.2} ] }
+```
+
+---------------------------------------------------------------------------------------------------
+
+## 3. Using the API
+
+| Method & path | Purpose |
 |---|---|
-| New/edited Excel or JSON file | Drop it in `data/incoming/` → `python -m pipeline run` (JSON folder: `--incoming data/json`) |
-| Only prices changed | Same command. Only changed rows are updated, only affected documents re-embedded |
-| Not sure the file is clean | `python -m pipeline run --dry-run` |
-| Items were deleted from Excel | `python -m pipeline run --prune` (default is to keep old rows – safer) |
-| Re-do everything | `python -m pipeline run --force` |
-| Changed embedding model | Change `.env`, then `python -m pipeline embed --force` |
-| Something failed | Read the message (it names the sheet, column and Excel row). Fix, re-run. Nothing partial is ever written |
-| What happened last time? | `python -m pipeline status` or `SELECT * FROM etl_runs ORDER BY run_id DESC;` |
+| `POST /menu-items` | create (409 if the id exists, 422 if the data is invalid) |
+| `GET /menu-items?skip=0&limit=50&q=biryani&branch_id=UTG-KHI-001` | list, paginate, filter, search |
+| `GET /menu-items/{id}` | read one (404 if missing) |
+| `PUT /menu-items/{id}` | replace the whole document |
+| `PATCH /menu-items/{id}` | change only the fields you send; `null` removes a field; lists are replaced whole |
+| `DELETE /menu-items/{id}` | delete (409 if something still references it) |
+| `GET /search?q=spicy chicken rice&k=5&doc_type=menu_item` | search by meaning |
+| `GET /availability/{branch_id}` | live portions per dish from current stock |
+| `POST /admin/reindex` | re-embed changed documents now (`?force=true` re-embeds all) |
+| `GET /health` | API + database check |
 
-**Excel or JSON, your choice.** Both formats go through the same pipeline and give identical results (verified: loading
-the JSON files over the Excel-loaded database changed 0 of 1,500+ rows). The JSON layout is
-`{"Sheet_Name": [ {"Column": value, ...}, ... ]}`: one file per workbook, one list of row objects per sheet, same headers as Excel.
-Use `--incoming data/json` to point at a folder of JSON files (sample files are included). Keep one format per folder: if an .xlsx and a .json
-of the same kind sit together, the most recently modified one is used.
+The same six endpoints exist for: `/menu-items`, `/categories`, `/deals`, `/ingredients`, `/suppliers`,
+`/branches`, `/branch-stock`, `/stock-movements`, `/allergens`, `/service-rules`.
 
-Files are recognised by **sheet names**, not file names, so `Menu_Catalog_v2.xlsx` works. If several files of
-the same kind are in the folder, the newest wins. Every loaded file is copied to `data/archive/`.
+PowerShell examples:
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/menu-items/MENU001
 
-**Scheduling** (when you want it automatic): the command is a normal process with exit code 0/1, so any scheduler can run it.
-Linux/Mac cron: `0 2 * * * cd /path/to/project && .venv/bin/python -m pipeline run >> pipeline.log 2>&1`.
-Windows: Task Scheduler. Later you can wrap `run_pipeline()` in a Prefect/Airflow task unchanged.
+Invoke-RestMethod -Method Patch -Uri http://127.0.0.1:8000/menu-items/MENU001 `
+  -ContentType "application/json" -Body '{"base_price_pkr": 450}'
+
+Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:8000/branch-stock/UTG-KHI-001:ING001" `
+  -ContentType "application/json" -Body '{"available": 12.5, "stock_status": "REORDER"}'
+
+Invoke-RestMethod "http://127.0.0.1:8000/search?q=something spicy with rice&k=3"
+```
+
+**Embeddings stay fresh automatically.** After a create/update/delete on menu items, deals, ingredients, allergens or
+rules, the changed documents are re-embedded in the background (only those whose text changed).
+Turn that off with `AUTO_REINDEX=false` in `.env` and use `POST /admin/reindex` instead.
 
 ---------------------------------------------------------------------------------------------------
 
-## 3. Project layout
+## 4. Updating data later
 
-```
-docker-compose.yml        Postgres 16 + pgvector
-sql/schema.sql            all tables, indexes, views (idempotent)
-pipeline/
-  config.py               settings + one TableSpec per Excel sheet  <- the "brain"
-  extract.py              find files, read Excel/JSON sheets, clean + type-cast
-  validate.py             primary key / foreign key / range checks
-  load.py                 idempotent upsert (+ optional prune)
-  documents.py            DB rows -> natural-language documents
-  embeddings.py           Gemini (or fake) embedder, incremental sync, search
-  runner.py               orchestration of all steps
-  cli.py                  python -m pipeline <command>
-data/incoming/            put .xlsx (or .json) files here    data/json/  the JSON versions of the two workbooks
-data/archive/             copies of every loaded file
-tests/test_pipeline.py    pytest -q   (no DB / API needed)
-```
+Replace the JSON files in `data/json/` (names can change; files are recognised by their sheet names) and run
+`python -m app.ingest` again. It is **idempotent**: unchanged documents are skipped, so the second run says
+`inserted=0 updated=0` everywhere and embeds nothing.
 
-### Database model
+| Option | Meaning |
+|---|---|
+| `--dry-run` | validate only |
+| `--prune` | also delete documents that are no longer in the files (**also deletes documents you created through the API**) |
+| `--force` | re-embed everything |
+| `--embed-only` | skip loading; only rebuild embeddings / vector index |
+| `--json-dir PATH` | read the files from another folder |
 
-```
-suppliers ─< ingredients >─ recipes >─ menu_items ─< variants       categories ─< menu_items
-branches ─< branch_stock >─ ingredients                menu_items ─< item_aliases, item_addons >─ addons
-branches ─< branch_menu >─ menu_items                  deals ─< deal_items >─ menu_items / variants
-branches ─< stock_movements                            allergen_guide, service_rules (reference)
-documents (text + vector(768))   etl_runs, source_files (pipeline bookkeeping)
-```
-
-Views for your chatbot/API: `v_menu_live_availability` (live portions per branch computed from stock × recipes –
-verified identical to the Excel snapshot for all 64 recipe-linked branch items) and `v_low_stock`.
+Caution: the JSON files are the source of truth *for ingestion*. If you edited a document through the API and then
+ingest again, the file's version wins for documents that exist in the file.
 
 ---------------------------------------------------------------------------------------------------
 
-## 4. Data Engineering Pipeline – the concepts, mapped to this project
+## 5. MongoDB concepts, mapped to this project
 
-**What is a data pipeline?** An automated, repeatable path that moves data from a *source* to a *destination*
-and improves its quality on the way. Here: Excel → clean tables → searchable embeddings.
+* **Document database.** A document is JSON-like (stored as BSON) and can hold lists and sub-documents. A collection is a
+  set of documents, similar to a table but without a fixed schema.
+* **`_id`.** Every document has a unique `_id`, always indexed. We use the business key (`MENU001`, or `BRANCH:ING` for stock) so
+  loading the same data twice updates the same document instead of creating a duplicate (idempotency).
+* **Embed vs reference** (the main design decision in MongoDB):
+  * *Embed* data that is read together and belongs to one parent: a dish and its sizes, add-ons, aliases, branch prices and
+    recipe. One read returns everything, no joins.
+  * *Reference* (store an id) data with its own life or shared by many: ingredients, suppliers, branches, and stock levels that change daily.
+  * Trade-off: embedded copies can go stale (the recipe stores `ingredient_name`; an ingest refreshes it) and an embedded add-on price
+    appears in every dish that offers it. We accepted this because the catalog changes rarely and is read constantly.
+* **No foreign keys.** MongoDB will happily store an orphan. So `app/transform.py` checks every reference before writing, and the
+  API refuses to delete a branch/ingredient/supplier/category that is still in use (409).
+* **Schema discipline.** MongoDB is schema-less; `app/schemas.py` (Pydantic) is the schema. The same models validate the JSON at
+  ingest time and every API request, so wrong types, negative prices and misspelled fields are rejected.
+* **Indexes** (`app/indexes.py`) make the filters fast: category, branch, alias phrase, branch+stock status, and so on.
+* **Why PyMongo (sync) instead of async Motor?** Plain `def` endpoints are easier to read and debug for a first API; FastAPI runs
+  them in a thread pool, so requests do not block each other. Motor is deprecated in favour of PyMongo's own async client, which is
+  an easy upgrade later.
+* **Dates** are ISO strings (`2026-10-31`): sortable, JSON friendly, no time-zone surprises for date-only data.
 
-**ETL vs ELT.** ETL = Extract, Transform, Load (clean *before* loading). ELT = load raw first, transform inside
-the warehouse. We use ETL because the data is small and Excel is messy. At scale you would typically land raw
-data first and transform with SQL/dbt.
-
-**The stages and where to find them**
-
-| Stage | Purpose | Code |
-|---|---|---|
-| Ingest / Extract | Find and read the source | `extract.discover`, `read_table` |
-| Transform / Clean | Trim, type-cast, blank→NULL, drop duplicated columns | `extract.read_table` |
-| Validate (data quality) | Stop bad data from entering | `validate.validate_batch` |
-| Load | Write to the destination | `load.upsert` |
-| Enrich | Derive embeddings | `documents.py`, `embeddings.py` |
-| Orchestrate | Run steps in order, handle failure | `runner.run_pipeline` |
-| Observe | Know what happened | `etl_runs`, logs, `status` |
-
-**Key ideas you should be able to explain in an interview**
-
-1. **Idempotency** – running twice gives the same result as once. Achieved with `INSERT … ON CONFLICT DO UPDATE`
-   (upsert). Proven in the test run: a forced full reload reported `inserted=0 updated=0` for every table.
-2. **Incremental loading** – don't redo unchanged work. Three levels here: (a) file SHA-256 → skip an unchanged
-   workbook, (b) `IS DISTINCT FROM` → skip unchanged rows, (c) `content_hash` → skip re-embedding unchanged documents.
-3. **Schema & normalisation** – the inventory Excel repeats ingredient names/units on every stock row and stores
-   derived per-branch max portions. We store each fact once (names in `ingredients`, portions computed by a view),
-   so there's no stale copy to get out of sync.
-4. **Primary & foreign keys** – the database refuses orphan rows. We also check them *before* loading to give friendlier
-   errors (with Excel row numbers).
-5. **Fail fast + atomic loads** – validation errors stop the run before writes; all table writes happen in one
-   transaction, so a crash can never leave half a dataset (all-or-nothing, the "A" in ACID).
-6. **Data quality dimensions** – completeness (keys not null), uniqueness (no duplicate keys), validity (numbers are numbers,
-   prices ≥ 0), consistency (foreign keys). One bug caught during development: pandas turned empty cells into the text `"nan"`;
-   the FK check flagged it immediately – validation earns its keep.
-7. **Auditability / lineage** – `etl_runs` (who/when/what/result), `source_files` (which file version is loaded),
-   `data/archive/` (the exact file), `etl_created_at/etl_updated_at` per row.
-8. **Batch vs streaming** – this is batch (run when a file arrives). Streaming (Kafka, CDC) is for continuous, high-volume feeds.
-   Your real stock should eventually come from an API/DB feed, not a weekly Excel.
-9. **Hybrid retrieval for RAG** – embeddings are great for *meaning* ("something spicy with rice", Roman Urdu aliases)
-   but wrong for *fast-changing numbers*. So we embed only stable text and answer "is it in stock?" from
-   `v_menu_live_availability` at question time.
-10. **Embeddings basics** – text → vector of 768 numbers; similar meaning ⇒ nearby vectors; pgvector's `<=>` is cosine distance;
-    an HNSW index makes nearest-neighbour search fast. Documents use task type `RETRIEVAL_DOCUMENT`, questions use `RETRIEVAL_QUERY`.
-    Vectors below Gemini's native 3072 dims are re-normalised in code (`_normalize`).
-11. **Orchestration** – deciding order, retries and schedules. A tool like Prefect/Airflow adds a scheduler UI and retries; we
-    deliberately start without one. The embed step already retries with exponential backoff and commits per batch, so a rate-limit
-    failure resumes where it stopped.
+### Embeddings and vector search
+* An embedding turns text into a vector of 768 numbers; texts with similar meaning have vectors that point the same way
+  (cosine similarity). Documents are embedded with task type `RETRIEVAL_DOCUMENT`, questions with `RETRIEVAL_QUERY`.
+* Only **stable text** is embedded (names, descriptions, prices, aliases, rules). **Live stock is not**: it changes hourly, so
+  `/availability` computes it from `branch_stock` at question time. Meaning from embeddings, facts from the database
+  = *hybrid retrieval*, the standard design for RAG chatbots.
+* Search engines: **Atlas `$vectorSearch`** (approximate nearest neighbour over an HNSW index, scales to millions) and an
+  **in-Python exact search** used automatically while the Atlas index is building or if it is unavailable. For ~200 documents both
+  answer in milliseconds. `GET /search` shows which engine answered (`"engine"`).
+* The vector index is created by `python -m app.ingest`. Atlas needs about a minute to build it. If automatic creation is refused,
+  create it in the Atlas UI: *Atlas Search â†’ Create Search Index â†’ JSON editor â†’ collection `documents` â†’ index name
+  `documents_vector_index`, type **Vector Search*** and paste:
+  ```json
+  { "fields": [
+      { "type": "vector", "path": "embedding", "numDimensions": 768, "similarity": "cosine" },
+      { "type": "filter", "path": "doc_type" } ] }
+  ```
 
 ---------------------------------------------------------------------------------------------------
 
-## 5. Using it from your chatbot (hybrid query examples)
-
-```sql
--- Semantic: nearest menu documents to a question embedding (:qv = embedding of the user's question)
-SELECT doc_id, content, 1 - (embedding <=> :qv::vector) AS score
-FROM documents WHERE doc_type = 'menu_item' ORDER BY embedding <=> :qv::vector LIMIT 5;
-
--- Live facts for the dish the retriever found
-SELECT branch_name, price_pkr, availability, live_max_portions
-FROM v_menu_live_availability WHERE menu_id = 'MENU001';
-
--- Restock list
-SELECT * FROM v_low_stock ORDER BY branch_name, ingredient_name;
+## 6. Project layout
 ```
+app/
+  config.py        settings from .env
+  db.py            MongoDB connection + FastAPI dependency
+  schemas.py       Pydantic models + collection registry          <- add new fields here
+  transform.py     JSON sheets -> embedded documents, reference checks
+  ingest.py        python -m app.ingest   (idempotent upserts)
+  documents.py     stored documents -> text for embedding
+  embeddings.py    Gemini / fake embedder, incremental sync, background re-index
+  search.py        Atlas $vectorSearch + Python fallback
+  indexes.py       regular indexes + Atlas vector index
+  routers/crud.py  one factory = CRUD for all 10 collections     <- add a CrudConfig to add a collection
+  routers/extras.py  /search  /availability  /admin/reindex  /health
+  main.py          FastAPI app
+data/json/         the two JSON files
+tests/             pytest -q  (34 tests, in-memory MongoDB, no internet needed)
+```
+**Adding a collection later:** add a model + `Coll(...)` in `schemas.py`, build its documents in `transform.py`, and add one
+`CrudConfig` in `routers/crud.py`.
 
-Python: `from pipeline.embeddings import get_embedder, search` → `search(conn, get_embedder(), "kids meal", k=5)`.
+## 7. Tests
+```powershell
+pytest -q
+```
+They run against an in-memory MongoDB (mongomock) and the offline embedder, using your real JSON. They check ingestion,
+idempotency, bad-data rejection, every CRUD path, filters, the delete guard, live availability against the original
+snapshot values, search, and background re-embedding.
 
----------------------------------------------------------------------------------------------------
+## 8. Troubleshooting
+| Symptom | Cause / fix |
+|---|---|
+| `ServerSelectionTimeoutError` / `/health` fails | Your IP is not allowed in Atlas *Network Access*, or the URI is wrong |
+| `bad auth` / `Authentication failed` | Wrong user or password; URL-encode special characters in the password |
+| `The DNS query name does not exist` / SRV error | Copy the `mongodb+srv://` string again; check VPN/DNS; make sure `dnspython` is installed |
+| `GEMINI_API_KEY is not set` | Fill `.env`, or use `EMBEDDING_PROVIDER=fake` while testing |
+| `/search` says `"engine": "python"` | Normal while the Atlas index builds (about a minute) or if it could not be created automatically |
+| `N data problem(s) found; nothing was written` | Read the listed lines: they name the collection, id and field |
+| Gemini 429 errors | Free-tier rate limit; the pipeline waits and retries, and progress is saved per batch, so just run it again |
 
-## 6. Extending it
-
-* **New sheet/table**: add `CREATE TABLE` to `sql/schema.sql`, add a `TableSpec` to `config.SPECS` (parents before children). Done.
-* **New document type** (e.g. branches): add a query + loop in `documents.build_documents`.
-* **Different embedding model/dimension**: change `.env` **and** `vector(768)` in `schema.sql` (use a fresh table), then `embed --force`.
-* **Real stock feed**: the JSON reader is already the hook for this. Have the API/export write the same
-  `{"Branch_Stock": [ ... ]}` JSON (or add one small class like `JsonWorkbook` in `extract.py` that fetches it directly).
-* **Another file format** (CSV, Google Sheets): add a class with `.sheet_names` and `.parse(sheet)` and return it from `open_workbook`.
-
-## 7. Known limits / honest notes
-
-* Data in the workbooks is synthetic demo data (as the files state). Allergen fields are "Unverified" – do not let a chatbot
-  claim an item is allergen-free.
-* `Menu_Availability` (inventory) and the `Dashboard`/`START_HERE` sheets are intentionally not loaded: they are derived views or documentation.
-* JSON files must keep real `null` for empty values and ISO dates (`2026-10-31`), which your converted files do.
-  Error messages for JSON refer to *record numbers* (1 = first row of the sheet) instead of Excel row numbers.
-* The Excel `Branch_Stock` values (`On_Hand`, `Available`, …) are read as *cached* values; if a workbook is saved by a tool
-  that doesn't compute formulas, those columns arrive empty. Open and re-save in Excel first.
-* The Gemini free tier has rate limits; if you see 429 messages the pipeline waits and retries. Re-running continues where it stopped.
-* The pipeline was tested end-to-end against PostgreSQL 16 + pgvector with the offline embedder. The Gemini call itself follows the
-  official `google-genai` SDK signature but could not be executed in the build environment (no outbound access), so do your first real run
-  with `python -m pipeline run` and watch the first batch.
+## 9. Honest notes
+* Built and tested end to end with an in-memory MongoDB and the offline embedder, plus a live HTTP smoke test. **Not executed against real
+  Atlas or the Gemini API** (no outbound access where it was built). The code follows the official PyMongo and google-genai APIs; do the first
+  real run with `python -m app.ingest` and read the log. Atlas vector-index creation is the part most likely to need the UI fallback above.
+* Allergen fields in your data are marked unverified; do not let a chatbot claim a dish is allergen-free.
+* Never commit `.env` (it is in `.gitignore`). If a password or key ever lands on GitHub, rotate it immediately.
