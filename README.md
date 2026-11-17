@@ -1,6 +1,4 @@
 ![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-ai-dining-experience.png)
-
-![Urban Tandoor & Grill AI Restaurant Assistant](assets/urban-tandoor-ai-dining-experience.png)
 # Urban Tandoor â€“ MongoDB + Embeddings + FastAPI
 
 Loads the two JSON files (menu catalog + two-branch inventory) into **MongoDB Atlas** as embedded
